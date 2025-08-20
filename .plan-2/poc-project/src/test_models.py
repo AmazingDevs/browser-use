@@ -302,6 +302,260 @@ class SelectorExtractor:
         return None
     
     @staticmethod
+    def parse_action_for_qa(action_obj: Any) -> Dict[str, Any]:
+        """
+        Parse browser-use ActionModel objects into clean QA-friendly format.
+        
+        Args:
+            action_obj: ActionModel object from browser-use
+            
+        Returns:
+            Dictionary with 'type' and 'details' keys
+        """
+        try:
+            action_info = {
+                'type': 'unknown',
+                'details': {}
+            }
+            
+            if not action_obj:
+                return action_info
+            
+            # Convert action object to string for parsing
+            action_str = str(action_obj)
+            
+            # Parse different action types based on ActionModel structure
+            if 'GoToUrlActionModel' in action_str or 'go_to_url' in action_str:
+                action_info['type'] = 'navigate'
+                # Try to extract URL from the action string
+                url_match = re.search(r"url='([^']+)'", action_str)
+                if url_match:
+                    action_info['details']['url'] = url_match.group(1)
+                    
+            elif 'InputTextActionModel' in action_str or 'input_text' in action_str:
+                action_info['type'] = 'type'
+                # Extract index and text
+                index_match = re.search(r'index=(\d+)', action_str)
+                text_match = re.search(r"text='([^']+)'", action_str)
+                if index_match:
+                    action_info['details']['index'] = int(index_match.group(1))
+                if text_match:
+                    action_info['details']['text'] = text_match.group(1)
+                    
+            elif 'ClickElementByIndexActionModel' in action_str or 'click_element_by_index' in action_str:
+                action_info['type'] = 'click'
+                # Extract index
+                index_match = re.search(r'index=(\d+)', action_str)
+                if index_match:
+                    action_info['details']['index'] = int(index_match.group(1))
+                    
+            elif 'ScrollActionModel' in action_str or 'scroll' in action_str:
+                action_info['type'] = 'scroll'
+                
+            elif 'WaitActionModel' in action_str or 'wait' in action_str:
+                action_info['type'] = 'wait'
+                
+            elif 'DoneActionModel' in action_str or 'done' in action_str:
+                action_info['type'] = 'done'
+                # Extract success status and message
+                success_match = re.search(r'success=([^,)]+)', action_str)
+                if success_match:
+                    action_info['details']['success'] = success_match.group(1).lower() == 'true'
+                    
+            # If we couldn't parse it, extract a generic type
+            if action_info['type'] == 'unknown' and 'ActionModel' in action_str:
+                # Try to extract action type from the string
+                type_match = re.search(r'(\w+)ActionModel', action_str)
+                if type_match:
+                    action_info['type'] = type_match.group(1).lower().replace('action', '')
+            
+            return action_info
+            
+        except Exception as e:
+            print(f"Error parsing action for QA: {e}")
+            return {'type': 'unknown', 'details': {}}
+    
+    @staticmethod
+    def extract_qa_selector(dom_state: Any, action_details: Dict) -> Dict[str, str]:
+        """
+        Extract QA-focused selector based on DOM state and action details.
+        
+        Args:
+            dom_state: Browser DOM state
+            action_details: Parsed action details with index/text info
+            
+        Returns:
+            Dictionary with 'selector' and 'type' keys
+        """
+        try:
+            result = {
+                'selector': None,
+                'type': 'fallback'
+            }
+            
+            # If we have an index from action details, try to use it for selector
+            element_index = action_details.get('index')
+            
+            # Try to access browser state elements using the index
+            if element_index is not None and hasattr(dom_state, 'interactive_elements'):
+                try:
+                    interactive_elements = dom_state.interactive_elements
+                    if isinstance(interactive_elements, (list, tuple)) and len(interactive_elements) > element_index:
+                        element = interactive_elements[element_index]
+                        selector = SelectorExtractor._extract_from_interactive_element(element)
+                        if selector:
+                            result['selector'] = selector
+                            result['type'] = 'interactive'
+                            return result
+                except (IndexError, AttributeError):
+                    pass
+            
+            # Fall back to standard DOM element extraction
+            if hasattr(dom_state, 'dom_elements') and dom_state.dom_elements:
+                selector = SelectorExtractor.extract_selector_from_dom_state(dom_state)
+                if selector and selector != 'body':
+                    result['selector'] = selector
+                    result['type'] = 'dom_element'
+                    return result
+            
+            # Generate contextual selector based on action type and URL
+            contextual_selector = SelectorExtractor._generate_contextual_selector(dom_state, action_details)
+            if contextual_selector:
+                result['selector'] = contextual_selector
+                result['type'] = 'contextual'
+                return result
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error extracting QA selector: {e}")
+            return {'selector': None, 'type': 'error'}
+    
+    @staticmethod
+    def _extract_from_interactive_element(element: Any) -> Optional[str]:
+        """Extract selector from browser-use interactive element."""
+        try:
+            # Interactive elements typically have an index and text/description
+            if hasattr(element, 'selector'):
+                return element.selector
+            
+            if hasattr(element, 'text') and element.text:
+                # Create text-based selector
+                clean_text = element.text.strip()[:50]
+                if clean_text:
+                    clean_text = clean_text.replace("'", "\\'")
+                    return f"text='{clean_text}'"
+            
+            if hasattr(element, 'tag_name'):
+                tag = element.tag_name.lower()
+                # Create basic tag selector with refinements
+                if hasattr(element, 'attributes') and element.attributes:
+                    attrs = element.attributes
+                    if 'id' in attrs:
+                        return f"#{attrs['id']}"
+                    elif 'data-testid' in attrs:
+                        return f"[data-testid='{attrs['data-testid']}']"
+                    elif 'class' in attrs:
+                        classes = attrs['class'].split()[:2]  # Limit classes
+                        class_selector = '.' + '.'.join(classes)
+                        return f"{tag}{class_selector}"
+                return tag
+                
+        except Exception:
+            pass
+        return None
+    
+    @staticmethod
+    def _generate_contextual_selector(dom_state: Any, action_details: Dict) -> Optional[str]:
+        """Generate contextual selector based on page context and action."""
+        try:
+            action_type = action_details.get('type', 'unknown')
+            page_url = getattr(dom_state, 'url', '') if dom_state else ''
+            
+            # Context-aware selectors for common scenarios
+            if 'login' in page_url.lower() or 'signin' in page_url.lower():
+                if action_type == 'type':
+                    text_value = action_details.get('text', '').lower()
+                    if 'user' in text_value or 'email' in text_value:
+                        return "#username, #email, input[name='username'], input[name='email']"
+                    elif 'pass' in text_value:
+                        return "#password, input[name='password'], input[type='password']"
+                elif action_type == 'click':
+                    return "button[type='submit'], input[type='submit'], .login-btn, .signin-btn"
+            
+            elif 'saucedemo.com' in page_url:
+                if action_type == 'type':
+                    text_value = action_details.get('text', '').lower()
+                    if 'standard_user' in text_value:
+                        return "#user-name"
+                    elif 'secret_sauce' in text_value:
+                        return "#password"
+                elif action_type == 'click':
+                    return "#login-button, .btn_action, button[type='submit']"
+            
+            # Generic contextual selectors based on action type
+            if action_type == 'type':
+                return "input[type='text'], input[type='email'], textarea"
+            elif action_type == 'click':
+                return "button, a, .btn, [role='button']"
+            elif action_type == 'navigate':
+                return "body"  # Navigation doesn't target specific elements
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    @staticmethod
+    def get_fallback_selector(action_type: str, action_details: Dict) -> str:
+        """
+        Generate fallback selectors based on action type and context.
+        
+        Args:
+            action_type: Type of action (click, type, navigate, etc.)
+            action_details: Additional action context
+            
+        Returns:
+            Fallback selector string
+        """
+        try:
+            # Context-aware fallback selectors
+            fallback_selectors = {
+                'navigate': 'body',
+                'click': 'button, a, .btn, [role="button"]',
+                'type': 'input[type="text"], input[type="email"], textarea',
+                'scroll': 'main, .content, body',
+                'wait': '.loading, .spinner, body',
+                'verify': '.status, .message, .result',
+                'hover': '.tooltip-trigger, .hover-target',
+                'select': 'select, .dropdown, .select-input',
+                'done': 'body'
+            }
+            
+            # Get base fallback selector
+            base_selector = fallback_selectors.get(action_type, 'body')
+            
+            # Enhance with action details if available
+            if action_type == 'type' and 'text' in action_details:
+                text_value = action_details['text'].lower()
+                if 'user' in text_value or 'email' in text_value:
+                    return '#username, #email, input[name="username"]'
+                elif 'pass' in text_value:
+                    return '#password, input[type="password"]'
+                elif '@' in text_value:
+                    return 'input[type="email"], input[name="email"]'
+                    
+            elif action_type == 'click' and 'index' in action_details:
+                # Use index to create a more specific selector
+                index = action_details['index']
+                return f'button:nth-child({index + 1}), .btn:nth-child({index + 1})'
+            
+            return base_selector
+            
+        except Exception:
+            return 'body'  # Ultimate fallback
+    
+    @staticmethod
     def _fallback_selector_from_state(dom_state: Any) -> Optional[str]:
         """Generate fallback selector when dom_elements is not available"""
         try:

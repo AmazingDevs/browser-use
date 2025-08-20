@@ -39,13 +39,13 @@ async def basic_example():
             timeout=120  # Reduced from 300 to 120 seconds
         )
         
-        # Run exploratory testing with fewer steps
+        # Run exploratory testing with sufficient steps for proper exploration
         result = await asyncio.wait_for(
             generator.generate_exploratory_tests(
                 url="https://www.saucedemo.com",
-                max_steps=4  # Reduced from 10 to 4
+                max_steps=10  # Increased for proper exploration
             ),
-            timeout=180  # 3 minute timeout for this example
+            timeout=300  # 5 minute timeout for proper exploration
         )
         
         # Display results
@@ -84,13 +84,13 @@ async def form_testing_example():
             timeout=120  # Reduced timeout
         )
         
-        # Test a form-heavy site with fewer steps
+        # Test a form-heavy site with sufficient steps
         result = await asyncio.wait_for(
             generator.generate_exploratory_tests(
                 url="https://httpbin.org/forms/post",
-                max_steps=5  # Reduced from 15 to 5
+                max_steps=20  # Increased for proper form exploration
             ),
-            timeout=180  # 3 minute timeout
+            timeout=300  # 5 minute timeout
         )
         
         logger.info(f"✅ Form testing completed: {len(result['test_cases'])} scenarios")
@@ -117,14 +117,14 @@ async def generate_playwright_scripts():
     logger.info("🎭 Generating Playwright test scripts...")
     
     try:
-        # Run basic exploration first with reduced steps
-        generator = ExploratoryQAGenerator(timeout=120)
+        # Run basic exploration first with sufficient steps
+        generator = ExploratoryQAGenerator(timeout=180)
         result = await asyncio.wait_for(
             generator.generate_exploratory_tests(
                 url="https://www.saucedemo.com",
-                max_steps=3  # Reduced from 8 to 3
+                max_steps=15  # Increased for better script generation
             ),
-            timeout=180  # 3 minute timeout
+            timeout=300  # 5 minute timeout
         )
         
         # Generate Playwright scripts
@@ -168,13 +168,13 @@ async def batch_testing_example():
         try:
             logger.info(f"🌐 Testing URL {i+1}/{len(test_urls)}: {url}")
             
-            # Add timeout for each URL test
+            # Add timeout for each URL test with sufficient steps
             result = await asyncio.wait_for(
                 generator.generate_exploratory_tests(
                     url=url,
-                    max_steps=3  # Reduced from 8 to 3
+                    max_steps=15  # Increased for better batch testing
                 ),
-                timeout=150  # 2.5 minute timeout per URL
+                timeout=300  # 5 minute timeout per URL
             )
             
             result['source_url'] = url
@@ -236,9 +236,9 @@ async def performance_testing_example():
         result = await asyncio.wait_for(
             generator.generate_exploratory_tests(
                 url="https://www.saucedemo.com",
-                max_steps=4  # Reduced from 12 to 4
+                max_steps=20  # Increased for performance testing
             ),
-            timeout=180  # 3 minute timeout
+            timeout=300  # 5 minute timeout
         )
         
         # Calculate performance metrics

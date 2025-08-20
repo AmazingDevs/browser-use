@@ -89,3 +89,7 @@ CLAUDE.md
 .claude/.claude.json
 .roo/*
 .roomodes
+
+
+.plan-2/poc-project/outputs/browser_data
+.serena
