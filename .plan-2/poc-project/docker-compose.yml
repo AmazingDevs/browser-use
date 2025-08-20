@@ -1,0 +1,94 @@
+version: "3.8"
+
+services:
+  poc-qa-generator:
+    build: .
+    container_name: exploratory-qa-poc
+    environment:
+      # AI Provider Configuration (choose one)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      
+      # Browser Configuration
+      - BROWSER_USE_SETUP_LOGGING=true
+      - BROWSER_USE_TELEMETRY=false
+      - POC_HEADLESS=true
+      - POC_MAX_STEPS=20
+      - POC_TIMEOUT=300
+      
+      # Logging Configuration
+      - POC_LOG_LEVEL=INFO
+      - PYTHONPATH=/app
+    
+    volumes:
+      # Mount outputs directory for generated test cases
+      - ./outputs:/app/outputs
+      # Mount logs directory for application logs
+      - ./logs:/app/logs
+      # Mount config directory for custom configurations
+      - ./config:/app/config
+    
+    ports:
+      - "8000:8000"
+    
+    deploy:
+      resources:
+        limits:
+          # Limit resources for container stability
+          memory: 2G
+          cpus: "1.0"
+        reservations:
+          memory: 512M
+          cpus: "0.25"
+    
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import src.test_models; print('Health OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: POC Validation Service
+  poc-validator:
+    build: .
+    container_name: poc-validator
+    command: ["python3", "examples/run_validation.py"]
+    environment:
+      - PYTHONPATH=/app
+      - POC_LOG_LEVEL=INFO
+    volumes:
+      - ./outputs:/app/outputs
+    depends_on:
+      - poc-qa-generator
+    profiles:
+      - validation
+
+  # Optional: Test Runner Service
+  test-runner:
+    build: .
+    container_name: poc-test-runner
+    command: ["python3", "-m", "pytest", "tests/", "-v"]
+    environment:
+      - PYTHONPATH=/app
+      - PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+    volumes:
+      - ./outputs:/app/outputs
+      - ./test-results:/app/test-results
+    depends_on:
+      - poc-qa-generator
+    profiles:
+      - testing
+
+networks:
+  default:
+    name: poc-qa-network
+    driver: bridge
+
+volumes:
+  poc_outputs:
+    driver: local
+  poc_logs:
+    driver: local
