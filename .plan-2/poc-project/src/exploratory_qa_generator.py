@@ -17,8 +17,10 @@ import json
 import uuid
 import os
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Union
 from pathlib import Path
+from dataclasses import dataclass, asdict
+from contextlib import asynccontextmanager
 from browser_use.llm import ChatOpenAI, ChatAnthropic
 
 # Import from existing test_models module
@@ -31,9 +33,248 @@ from test_models import (
     create_test_case
 )
 
-EXPLORATORY_QA_OVERRIDE = """
 
+@dataclass
+class TestCaseStep:
+    """Data class for individual test case steps."""
+    step_number: int
+    url: str
+    timestamp: str
+    test_cases: str  # Plain text Gherkin scenarios
+    incomplete_test_cases: str  # Scenarios with [INCOMPLETE] markers
+    extracted_content: Optional[str] = None
+    action_type: Optional[str] = None
+
+
+class TestCaseManager:
+    """Thread-safe manager for test case accumulation and persistence."""
+    
+    def __init__(self, session_id: str, output_dir: str = "./outputs/test_cases"):
+        self.session_id = session_id
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # State management
+        self._accumulated_steps: List[TestCaseStep] = []
+        self._incomplete_queue: List[Dict[str, Any]] = []
+        self._lock = asyncio.Lock()  # Thread safety
+        
+        # File paths
+        self.session_file = self.output_dir / f"test_cases_{session_id}.json"
+        self.cumulative_file = self.output_dir / f"all_test_cases_{session_id}.feature"
+        
+        print(f"[INFO] TestCaseManager initialized: {self.output_dir}")
+    
+    async def add_step(self, step_data: TestCaseStep) -> None:
+        """Add a test case step with thread safety."""
+        async with self._lock:
+            try:
+                # Add to accumulator
+                self._accumulated_steps.append(step_data)
+                
+                # Update incomplete queue
+                await self._update_incomplete_queue(step_data)
+                
+                # Save incrementally
+                await self._save_step_incrementally(step_data)
+                
+                print(f"[SUCCESS] Step {step_data.step_number}: Saved {self._count_scenarios(step_data.test_cases)} complete + {self._count_scenarios(step_data.incomplete_test_cases)} incomplete scenarios")
+                
+            except Exception as e:
+                print(f"[WARNING] Error adding step {step_data.step_number}: {e}")
+    
+    async def get_incomplete_cases_for_injection(self) -> str:
+        """Get formatted incomplete test cases for context injection."""
+        async with self._lock:
+            if not self._incomplete_queue:
+                return ""
+            
+            # Format for injection (limit to last 5 to prevent context overflow)
+            recent_incomplete = self._incomplete_queue[-5:]
+            
+            injection_text = "\n\n".join([
+                f"# From Step {case['from_step']} - {case['url']}\n{case['text']}"
+                for case in recent_incomplete
+                if case.get('text') and '[INCOMPLETE]' in case['text']
+            ])
+            
+            return injection_text
+    
+    async def _update_incomplete_queue(self, step_data: TestCaseStep) -> None:
+        """Update incomplete test cases queue."""
+        if step_data.incomplete_test_cases and '[INCOMPLETE]' in step_data.incomplete_test_cases:
+            # Add to queue
+            self._incomplete_queue.append({
+                'text': step_data.incomplete_test_cases,
+                'from_step': step_data.step_number,
+                'url': step_data.url,
+                'timestamp': step_data.timestamp
+            })
+            
+            # Keep only last 10 items to prevent memory growth
+            self._incomplete_queue = self._incomplete_queue[-10:]
+    
+    async def _save_step_incrementally(self, step_data: TestCaseStep) -> None:
+        """Save step data to files with error handling."""
+        try:
+            # 1. Save to JSON file
+            await self._save_json_data(step_data)
+            
+            # 2. Save complete test cases to .feature file
+            if step_data.test_cases and step_data.test_cases.strip():
+                await self._save_feature_data(step_data)
+                
+        except Exception as e:
+            print(f"[WARNING] Error saving step {step_data.step_number}: {e}")
+    
+    async def _save_json_data(self, step_data: TestCaseStep) -> None:
+        """Save to JSON file for complete session data."""
+        try:
+            # Load existing data
+            if self.session_file.exists():
+                with open(self.session_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                data = {"session_id": self.session_id, "steps": []}
+            
+            # Add new step
+            data["steps"].append(asdict(step_data))
+            data["total_steps"] = len(data["steps"])
+            data["last_updated"] = datetime.now().isoformat()
+            
+            # Save back
+            with open(self.session_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"[WARNING] Error saving JSON: {e}")
+    
+    async def _save_feature_data(self, step_data: TestCaseStep) -> None:
+        """Append complete test cases to cumulative .feature file."""
+        try:
+            with open(self.cumulative_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n# === Step {step_data.step_number} - {step_data.url} ===\n")
+                f.write(f"# Generated: {step_data.timestamp}\n\n")
+                f.write(step_data.test_cases)
+                f.write("\n\n" + "=" * 80 + "\n")
+                
+        except Exception as e:
+            print(f"[WARNING] Error saving feature file: {e}")
+    
+    def _count_scenarios(self, gherkin_text: str) -> int:
+        """Count scenarios in Gherkin text."""
+        if not gherkin_text or not gherkin_text.strip():
+            return 0
+        return len([line for line in gherkin_text.split('\n') if line.strip().startswith('Scenario')])
+    
+    async def get_summary(self) -> Dict[str, Any]:
+        """Get session summary statistics."""
+        async with self._lock:
+            total_complete = sum(self._count_scenarios(step.test_cases) for step in self._accumulated_steps)
+            total_incomplete = len(self._incomplete_queue)
+            
+            return {
+                "session_id": self.session_id,
+                "total_steps": len(self._accumulated_steps),
+                "total_complete_scenarios": total_complete,
+                "total_incomplete_scenarios": total_incomplete,
+                "output_files": {
+                    "json_data": str(self.session_file),
+                    "feature_file": str(self.cumulative_file)
+                }
+            }
+
+
+# Global instance holder for hook access
+_test_case_manager: Optional[TestCaseManager] = None
+
+
+async def exploratory_step_hook(agent) -> None:
+    """Hook function to extract test cases from AI responses after each step."""
+    global _test_case_manager
+    
+    try:
+        if not _test_case_manager:
+            print("[WARNING] TestCaseManager not initialized, skipping step hook")
+            return
+        
+        # Access agent history
+        if not agent.history or not agent.history.history:
+            print("[INFO] No history available yet")
+            return
+        
+        last_step = agent.history.history[-1]
+        
+        # Extract test cases from AI model output
+        if hasattr(last_step, 'model_output') and last_step.model_output:
+            # Get test case data from AI response
+            test_cases_text = getattr(last_step.model_output, 'test_cases', '')
+            incomplete_cases_text = getattr(last_step.model_output, 'incomplete_test_cases', '')
+            
+            # Create step data
+            step_data = TestCaseStep(
+                step_number=getattr(last_step.metadata, 'step_number', len(agent.history.history)),
+                url=getattr(last_step.state, 'url', 'unknown'),
+                timestamp=datetime.now().isoformat(),
+                test_cases=test_cases_text,
+                incomplete_test_cases=incomplete_cases_text,
+                extracted_content=getattr(last_step.result[0], 'extracted_content', None) if last_step.result else None,
+                action_type=getattr(last_step.model_output, 'action', 'unknown') if hasattr(last_step.model_output, 'action') else 'unknown'
+            )
+            
+            # Add to manager
+            await _test_case_manager.add_step(step_data)
+        
+    except Exception as e:
+        # Non-blocking error handling
+        print(f"[WARNING] Hook error (non-critical): {e}")
+
+
+async def on_step_start_hook(agent) -> None:
+    """Hook function to inject incomplete test cases before each step."""
+    global _test_case_manager
+    
+    try:
+        if not _test_case_manager:
+            return
+        
+        # Get incomplete cases for injection
+        incomplete_cases = await _test_case_manager.get_incomplete_cases_for_injection()
+        
+        if incomplete_cases:
+            print(f"[INFO] Injecting incomplete test cases from previous steps")
+            # Note: Actual injection mechanism would need to be implemented based on
+            # how browser-use supports dynamic system message modification
+            # For now, we're preparing the data structure
+        
+        # Reinforce test case generation requirements
+        print(f"[INFO] Reminder: Generate 8-10 comprehensive test cases in this step")
+        
+    except Exception as e:
+        print(f"[WARNING] Start hook error (non-critical): {e}")
+
+
+EXPLORATORY_QA_OVERRIDE = """
+[INFO] **ENHANCED TEST CASE GENERATION OBJECTIVE**:
+
+Your primary dual mission:
+1. Complete your assigned <user_request> task efficiently
+2. **Generate 8-10 comprehensive test cases per step** covering multiple UI aspects
+
+**Test Case Generation Requirements:**
+- Always output 8-10 test scenarios per step in your JSON response
+- Cover different UI components, workflows, validation scenarios, and edge cases
+- Use Gherkin format with Given-When-Then structure
+- Mark incomplete scenarios with [INCOMPLETE] and provide missing_info explanations
+- Include specific element references and expected outcomes
+
+**Output Format:** Your JSON response MUST include:
+- "test_cases": Plain text Gherkin scenarios (8-10 complete scenarios)
+- "incomplete_test_cases": Scenarios needing additional information with [INCOMPLETE] markers
+
+**Integration:** Complete incomplete test cases when your actions provide the missing information.
 """
+
 
 class ExploratoryQAGenerator:
     """
@@ -45,14 +286,13 @@ class ExploratoryQAGenerator:
     
     def __init__(self, timeout: int = 300, use_mock_llm: bool = False, **kwargs):
         """Initialize the exploratory QA generator."""
-        # Global accumulator accessible by hooks
-        global test_accumulator
-        test_accumulator.clear()
-        
         self.explored_elements: Set[str] = set()
         self.timeout = timeout
         self.session_id = str(uuid.uuid4())[:8]
         self.use_mock_llm = use_mock_llm
+        
+        # Initialize test case manager
+        self.test_case_manager = TestCaseManager(self.session_id)
         
         # Handle any additional kwargs that might be passed
         self.config = kwargs
@@ -76,8 +316,14 @@ class ExploratoryQAGenerator:
         Returns:
             Dictionary containing test cases and exploration summary
         """
+        global _test_case_manager
+        browser_session = None
+        
         try:
             print(f"Starting exploratory testing session for: {url}")
+            
+            # Set global manager for hook access
+            _test_case_manager = self.test_case_manager
             
             # 1. Initialize browser with proper session management
             browser_session = await self._create_browser_session()
@@ -87,15 +333,25 @@ class ExploratoryQAGenerator:
             
             # 3. Run exploration with proper hook registration
             await self._run_exploration(agent, max_steps)
-           
-            return agent
+            
+            # 4. Get final summary
+            summary = await self.test_case_manager.get_summary()
+            
+            return {
+                "session_id": self.session_id,
+                "url": url,
+                "exploration_summary": summary,
+                "success": True
+            }
             
         except Exception as e:
             print(f"Error during exploratory testing: {e}")
-            return {"error": str(e), "test_cases": [], "total_steps": 0}
+            return {"error": str(e), "test_cases": [], "total_steps": 0, "success": False}
         finally:
             # Cleanup resources
-            await self._cleanup_session(browser_session if 'browser_session' in locals() else None)
+            await self._cleanup_session(browser_session)
+            # Clear global reference
+            _test_case_manager = None
     
     async def _create_browser_session(self):
         """Create browser session with error handling and critical validations."""
@@ -107,7 +363,24 @@ class ExploratoryQAGenerator:
             print("Creating browser session...")
             
             # Get environment variables with validation
-            chromium_path = os.getenv('PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH', '/usr/bin/google-chrome')
+            default_chrome_paths = [
+                'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+                '/usr/bin/google-chrome',
+                '/usr/bin/chromium-browser',
+                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+            ]
+            
+            chromium_path = os.getenv('PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH')
+            if not chromium_path:
+                # Auto-detect Chrome installation
+                for path in default_chrome_paths:
+                    if os.path.exists(path):
+                        chromium_path = path
+                        break
+                else:
+                    chromium_path = '/usr/bin/google-chrome'  # Fallback
+            
             headless = os.getenv('POC_HEADLESS', 'true').lower() == 'true'
             
             # Critical fix: Validate Chrome executable exists
@@ -157,7 +430,7 @@ class ExploratoryQAGenerator:
             
             # Task description that encourages exploration and documentation
             task_description = (
-                f"🔍 EXPLORATORY QA TESTING: Systematically explore {url} to discover and document functionality. "
+                f"EXPLORATORY QA TESTING: EXPLORATORY QA TESTING: Systematically explore {url} to discover and document functionality. "
                 f"Interact with different UI elements, test form inputs, navigate pages, and document your findings. "
                 f"Focus on discovering what the application can do and how it behaves with different inputs. "
                 f"Continue exploring different areas until max_steps is reached."
@@ -191,17 +464,17 @@ class ExploratoryQAGenerator:
             print(f"Starting exploration with max_steps: {max_steps}")
             
             # Run with proper hook registration and explicit step tracking
-            print(f"🚀 Starting exploration with {max_steps} max steps")
-            print(f"🎯 Hook registered: {exploratory_step_hook.__name__}")
+            print(f"[INFO] Starting exploration with {max_steps} max steps")
+            print(f"[INFO] Hooks registered: {exploratory_step_hook.__name__} and {on_step_start_hook.__name__}")
             
             await agent.run(
                 max_steps=max_steps,
-                on_step_end=exploratory_step_hook
+                on_step_start=on_step_start_hook,  # Inject incomplete test cases
+                on_step_end=exploratory_step_hook   # Extract test cases
             )
             
-            print(f"🏁 Exploration completed, accumulated {len(test_accumulator)} steps")
-            
-            print("Exploration completed successfully")
+            summary = await self.test_case_manager.get_summary()
+            print(f"[SUCCESS] Exploration completed: {summary['total_complete_scenarios']} scenarios generated")
             
         except Exception as e:
             print(f"Error during exploration: {e}")
