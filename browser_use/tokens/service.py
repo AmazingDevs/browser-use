@@ -5,19 +5,20 @@ Fetches pricing data from LiteLLM repository and caches it for 1 day.
 Automatically tracks token usage when LLMs are registered and invoked.
 """
 
-import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import aiofiles
+import anyio
 import httpx
 from dotenv import load_dotenv
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.views import ChatInvokeUsage
+from browser_use.tokens.custom_pricing import CUSTOM_MODEL_PRICING
+from browser_use.tokens.mappings import MODEL_TO_LITELLM
 from browser_use.tokens.views import (
 	CachedPricingData,
 	ModelPricing,
@@ -27,6 +28,7 @@ from browser_use.tokens.views import (
 	TokenUsageEntry,
 	UsageSummary,
 )
+from browser_use.utils import create_task_with_error_handling
 
 load_dotenv()
 
@@ -113,9 +115,7 @@ class TokenCost:
 				return False
 
 			# Read the cached data
-			async with aiofiles.open(cache_file, 'r') as f:
-				content = await f.read()
-				cached = CachedPricingData.model_validate_json(content)
+			cached = CachedPricingData.model_validate_json(await anyio.Path(cache_file).read_text())
 
 			# Check if cache is still valid
 			return datetime.now() - cached.timestamp < self.CACHE_DURATION
@@ -125,12 +125,11 @@ class TokenCost:
 	async def _load_from_cache(self, cache_file: Path) -> None:
 		"""Load pricing data from a specific cache file"""
 		try:
-			async with aiofiles.open(cache_file, 'r') as f:
-				content = await f.read()
-				cached = CachedPricingData.model_validate_json(content)
-				self._pricing_data = cached.data
+			content = await anyio.Path(cache_file).read_text()
+			cached = CachedPricingData.model_validate_json(content)
+			self._pricing_data = cached.data
 		except Exception as e:
-			print(f'Error loading cached pricing data from {cache_file}: {e}')
+			logger.debug(f'Error loading cached pricing data from {cache_file}: {e}')
 			# Fall back to fetching
 			await self._fetch_and_cache_pricing_data()
 
@@ -153,11 +152,9 @@ class TokenCost:
 			timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
 			cache_file = self._cache_dir / f'pricing_{timestamp_str}.json'
 
-			async with aiofiles.open(cache_file, 'w') as f:
-				await f.write(cached.model_dump_json(indent=2))
-
+			await anyio.Path(cache_file).write_text(cached.model_dump_json(indent=2))
 		except Exception as e:
-			print(f'Error fetching pricing data: {e}')
+			logger.debug(f'Error fetching pricing data: {e}')
 			# Fall back to empty pricing data
 			self._pricing_data = {}
 
@@ -167,10 +164,27 @@ class TokenCost:
 		if not self._initialized:
 			await self.initialize()
 
-		if not self._pricing_data or model_name not in self._pricing_data:
+		# Check custom pricing first
+		if model_name in CUSTOM_MODEL_PRICING:
+			data = CUSTOM_MODEL_PRICING[model_name]
+			return ModelPricing(
+				model=model_name,
+				input_cost_per_token=data.get('input_cost_per_token'),
+				output_cost_per_token=data.get('output_cost_per_token'),
+				max_tokens=data.get('max_tokens'),
+				max_input_tokens=data.get('max_input_tokens'),
+				max_output_tokens=data.get('max_output_tokens'),
+				cache_read_input_token_cost=data.get('cache_read_input_token_cost'),
+				cache_creation_input_token_cost=data.get('cache_creation_input_token_cost'),
+			)
+
+		# Map model name to LiteLLM model name if needed
+		litellm_model_name = MODEL_TO_LITELLM.get(model_name, model_name)
+
+		if not self._pricing_data or litellm_model_name not in self._pricing_data:
 			return None
 
-		data = self._pricing_data[model_name]
+		data = self._pricing_data[litellm_model_name]
 		return ModelPricing(
 			model=model_name,
 			input_cost_per_token=data.get('input_cost_per_token'),
@@ -227,7 +241,7 @@ class TokenCost:
 	# 	C_CYAN = '\033[96m'
 	# 	C_RESET = '\033[0m'
 
-	# 	cost_logger.info(f'🧠 llm : {C_CYAN}{llm.model}{C_RESET} (no usage found)')
+	# 	cost_logger.debug(f'🧠 llm : {C_CYAN}{llm.model}{C_RESET} (no usage found)')
 
 	async def _log_usage(self, model: str, usage: TokenUsageEntry) -> None:
 		"""Log usage to the logger"""
@@ -254,7 +268,7 @@ class TokenCost:
 		else:
 			output_part = f'📤 {C_GREEN}{completion_tokens_fmt}{C_RESET}'
 
-		cost_logger.info(f'🧠 {C_CYAN}{model}{C_RESET} | {input_part} | {output_part}')
+		cost_logger.debug(f'🧠 {C_CYAN}{model}{C_RESET} | {input_part} | {output_part}')
 
 	def _build_input_tokens_display(self, usage: ChatInvokeUsage, cost: TokenCostCalculated | None) -> str:
 		"""Build a clear display of input tokens breakdown with emojis and optional costs"""
@@ -322,17 +336,20 @@ class TokenCost:
 		token_cost_service = self
 
 		# Create a wrapped version that tracks usage
-		async def tracked_ainvoke(messages, output_format=None):
-			# Call the original method
-			result = await original_ainvoke(messages, output_format)
+		async def tracked_ainvoke(messages, output_format=None, **kwargs):
+			# Call the original method, passing through any additional kwargs
+			result = await original_ainvoke(messages, output_format, **kwargs)
 
 			# Track usage if available (no await needed since add_usage is now sync)
+			# Use llm.model instead of llm.name for consistency with get_usage_tokens_for_model()
 			if result.usage:
 				usage = token_cost_service.add_usage(llm.model, result.usage)
 
 				logger.debug(f'Token cost service: {usage}')
 
-				asyncio.create_task(token_cost_service._log_usage(llm.model, usage))
+				create_task_with_error_handling(
+					token_cost_service._log_usage(llm.model, usage), name='log_token_usage', suppress_exceptions=True
+				)
 
 			# else:
 			# 	await token_cost_service._log_non_usage_llm(llm)
@@ -475,13 +492,10 @@ class TokenCost:
 			completion_cost_part = ''
 
 		if len(summary.by_model) > 1:
-			cost_logger.info(
+			cost_logger.debug(
 				f'💲 {C_BOLD}Total Usage Summary{C_RESET}: {C_BLUE}{total_tokens_fmt} tokens{C_RESET}{total_cost_part} | '
 				f'⬅️ {C_YELLOW}{prompt_tokens_fmt}{prompt_cost_part}{C_RESET} | ➡️ {C_GREEN}{completion_tokens_fmt}{completion_cost_part}{C_RESET}'
 			)
-
-		# Log per-model breakdown
-		cost_logger.info(f'📊 {C_BOLD}Per-Model Usage Breakdown{C_RESET}:')
 
 		for model, stats in summary.by_model.items():
 			# Format tokens
@@ -520,7 +534,7 @@ class TokenCost:
 				prompt_part = f'{C_YELLOW}{model_prompt_fmt}{C_RESET}'
 				completion_part = f'{C_GREEN}{model_completion_fmt}{C_RESET}'
 
-			cost_logger.info(
+			cost_logger.debug(
 				f'  🤖 {C_CYAN}{model}{C_RESET}: {C_BLUE}{model_total_fmt} tokens{C_RESET}{cost_part} | '
 				f'⬅️ {prompt_part} | ➡️ {completion_part} | '
 				f'📞 {stats.invocations} calls | 📈 {avg_tokens_fmt}/call'
@@ -559,7 +573,7 @@ class TokenCost:
 				except Exception:
 					pass
 		except Exception as e:
-			print(f'Error cleaning old cache files: {e}')
+			logger.debug(f'Error cleaning old cache files: {e}')
 
 	async def ensure_pricing_loaded(self) -> None:
 		"""Ensure pricing data is loaded in the background. Call this after creating the service."""

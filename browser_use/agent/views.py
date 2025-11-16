@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,6 @@ from uuid_extensions import uuid7str
 
 from browser_use.agent.message_manager.views import MessageManagerState
 from browser_use.browser.views import BrowserStateHistory
-from browser_use.controller.registry.views import ActionModel
 from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMInteractedElement, DOMSelectorMap
 
 # from browser_use.dom.history_tree_processor.service import (
@@ -25,41 +25,42 @@ from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMInteractedEleme
 from browser_use.filesystem.file_system import FileSystemState
 from browser_use.llm.base import BaseChatModel
 from browser_use.tokens.views import UsageSummary
+from browser_use.tools.registry.views import ActionModel
+
+logger = logging.getLogger(__name__)
 
 
 class AgentSettings(BaseModel):
 	"""Configuration options for the Agent"""
 
-	use_vision: bool = True
+	use_vision: bool | Literal['auto'] = True
 	vision_detail_level: Literal['auto', 'low', 'high'] = 'auto'
-	use_vision_for_planner: bool = False
 	save_conversation_path: str | Path | None = None
 	save_conversation_path_encoding: str | None = 'utf-8'
 	max_failures: int = 3
-	retry_delay: int = 10
-	validate_output: bool = False
 	generate_gif: bool | str = False
 	override_system_message: str | None = None
 	extend_system_message: str | None = None
 	include_attributes: list[str] | None = DEFAULT_INCLUDE_ATTRIBUTES
-	max_actions_per_step: int = 10
+	max_actions_per_step: int = 4
 	use_thinking: bool = True
 	flash_mode: bool = False  # If enabled, disables evaluation_previous_goal and next_goal, and sets use_thinking = False
+	use_judge: bool = True
+	ground_truth: str | None = None  # Ground truth answer or criteria for judge validation
 	max_history_items: int | None = None
 
 	page_extraction_llm: BaseChatModel | None = None
-	planner_llm: BaseChatModel | None = None
-	planner_interval: int = 1  # Run planner every N steps
-	is_planner_reasoning: bool = False  # type: ignore
-	extend_planner_system_message: str | None = None
 	calculate_cost: bool = False
 	include_tool_call_examples: bool = False
-	llm_timeout: int = 60  # Timeout in seconds for LLM calls
+	llm_timeout: int = 60  # Timeout in seconds for LLM calls (auto-detected: 30s for gemini, 90s for o3, 60s default)
 	step_timeout: int = 180  # Timeout in seconds for each step
+	final_response_after_failure: bool = True  # If True, attempt one final recovery call after max_failures
 
 
 class AgentState(BaseModel):
 	"""Holds all state information for an Agent"""
+
+	model_config = ConfigDict(arbitrary_types_allowed=True)
 
 	agent_id: str = Field(default_factory=uuid7str)
 	n_steps: int = 1
@@ -67,14 +68,15 @@ class AgentState(BaseModel):
 	last_result: list[ActionResult] | None = None
 	last_plan: str | None = None
 	last_model_output: AgentOutput | None = None
+
+	# Pause/resume state (kept serialisable for checkpointing)
 	paused: bool = False
 	stopped: bool = False
+	session_initialized: bool = False  # Track if session events have been dispatched
+	follow_up_task: bool = False  # Track if the agent is a follow-up task
 
 	message_manager_state: MessageManagerState = Field(default_factory=MessageManagerState)
 	file_system_state: FileSystemState | None = None
-
-	# class Config:
-	# 	arbitrary_types_allowed = True
 
 
 @dataclass
@@ -87,6 +89,25 @@ class AgentStepInfo:
 		return self.step_number >= self.max_steps - 1
 
 
+class JudgementResult(BaseModel):
+	"""LLM judgement of agent trace"""
+
+	reasoning: str | None = Field(default=None, description='Explanation of the judgement')
+	verdict: bool = Field(description='Whether the trace was successful or not')
+	failure_reason: str | None = Field(
+		default=None,
+		description='Max 5 sentences explanation of why the task was not completed successfully in case of failure. If verdict is true, use an empty string.',
+	)
+	impossible_task: bool = Field(
+		default=False,
+		description='True if the task was impossible to complete due to vague instructions, broken website, inaccessible links, missing login credentials, or other insurmountable obstacles',
+	)
+	reached_captcha: bool = Field(
+		default=False,
+		description='True if the agent encountered captcha challenges during task execution',
+	)
+
+
 class ActionResult(BaseModel):
 	"""Result of executing an action"""
 
@@ -94,11 +115,17 @@ class ActionResult(BaseModel):
 	is_done: bool | None = False
 	success: bool | None = None
 
+	# For trace judgement
+	judgement: JudgementResult | None = None
+
 	# Error handling - always include in long term memory
 	error: str | None = None
 
 	# Files
 	attachments: list[str] | None = None  # Files to display in the done message
+
+	# Images (base64 encoded) - separate from text content for efficient handling
+	images: list[dict[str, Any]] | None = None  # [{"name": "file.jpg", "data": "base64_string"}]
 
 	# Always include in long term memory
 	long_term_memory: str | None = None  # Memory of this action
@@ -107,6 +134,9 @@ class ActionResult(BaseModel):
 	# if update_only_read_state is False we add the extracted_content to the agent long term memory if no long_term_memory is provided
 	extracted_content: str | None = None
 	include_extracted_content_only_once: bool = False  # Whether the extracted content should be used to update the read_state
+
+	# Metadata for observability (e.g., click coordinates)
+	metadata: dict | None = None
 
 	# Deprecated
 	include_in_memory: bool = False  # whether to include in extracted_content inside long_term_memory
@@ -152,7 +182,6 @@ class AgentOutput(BaseModel):
 	next_goal: str | None = None
 	action: list[ActionModel] = Field(
 		...,
-		description='List of actions to execute',
 		json_schema_extra={'min_items': 1},  # Ensure at least one action is provided
 	)
 
@@ -185,7 +214,6 @@ class AgentOutput(BaseModel):
 			),
 			__module__=AgentOutput.__module__,
 		)
-		model_.__doc__ = 'AgentOutput model with custom actions'
 		return model_
 
 	@staticmethod
@@ -205,12 +233,11 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutputNoThinking,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., description='List of actions to execute', json_schema_extra={'min_items': 1}),
+				Field(..., json_schema_extra={'min_items': 1}),
 			),
 			__module__=AgentOutputNoThinking.__module__,
 		)
 
-		model.__doc__ = 'AgentOutput model with custom actions'
 		return model
 
 	@staticmethod
@@ -234,12 +261,11 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutputFlashMode,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., description='List of actions to execute', json_schema_extra={'min_items': 1}),
+				Field(..., json_schema_extra={'min_items': 1}),
 			),
 			__module__=AgentOutputFlashMode.__module__,
 		)
 
-		model.__doc__ = 'AgentOutput model with custom actions'
 		return model
 
 
@@ -250,6 +276,7 @@ class AgentHistory(BaseModel):
 	result: list[ActionResult]
 	state: BrowserStateHistory
 	metadata: StepMetadata | None = None
+	state_message: str | None = None
 
 	model_config = ConfigDict(arbitrary_types_allowed=True, protected_namespaces=())
 
@@ -265,13 +292,76 @@ class AgentHistory(BaseModel):
 				elements.append(None)
 		return elements
 
-	def model_dump(self, **kwargs) -> dict[str, Any]:
-		"""Custom serialization handling circular references"""
+	def _filter_sensitive_data_from_string(self, value: str, sensitive_data: dict[str, str | dict[str, str]] | None) -> str:
+		"""Filter out sensitive data from a string value"""
+		if not sensitive_data:
+			return value
+
+		# Collect all sensitive values, immediately converting old format to new format
+		sensitive_values: dict[str, str] = {}
+
+		# Process all sensitive data entries
+		for key_or_domain, content in sensitive_data.items():
+			if isinstance(content, dict):
+				# Already in new format: {domain: {key: value}}
+				for key, val in content.items():
+					if val:  # Skip empty values
+						sensitive_values[key] = val
+			elif content:  # Old format: {key: value} - convert to new format internally
+				# We treat this as if it was {'http*://*': {key_or_domain: content}}
+				sensitive_values[key_or_domain] = content
+
+		# If there are no valid sensitive data entries, just return the original value
+		if not sensitive_values:
+			return value
+
+		# Replace all valid sensitive data values with their placeholder tags
+		for key, val in sensitive_values.items():
+			value = value.replace(val, f'<secret>{key}</secret>')
+
+		return value
+
+	def _filter_sensitive_data_from_dict(
+		self, data: dict[str, Any], sensitive_data: dict[str, str | dict[str, str]] | None
+	) -> dict[str, Any]:
+		"""Recursively filter sensitive data from a dictionary"""
+		if not sensitive_data:
+			return data
+
+		filtered_data = {}
+		for key, value in data.items():
+			if isinstance(value, str):
+				filtered_data[key] = self._filter_sensitive_data_from_string(value, sensitive_data)
+			elif isinstance(value, dict):
+				filtered_data[key] = self._filter_sensitive_data_from_dict(value, sensitive_data)
+			elif isinstance(value, list):
+				filtered_data[key] = [
+					self._filter_sensitive_data_from_string(item, sensitive_data)
+					if isinstance(item, str)
+					else self._filter_sensitive_data_from_dict(item, sensitive_data)
+					if isinstance(item, dict)
+					else item
+					for item in value
+				]
+			else:
+				filtered_data[key] = value
+		return filtered_data
+
+	def model_dump(self, sensitive_data: dict[str, str | dict[str, str]] | None = None, **kwargs) -> dict[str, Any]:
+		"""Custom serialization handling circular references and filtering sensitive data"""
 
 		# Handle action serialization
 		model_output_dump = None
 		if self.model_output:
 			action_dump = [action.model_dump(exclude_none=True) for action in self.model_output.action]
+
+			# Filter sensitive data only from input action parameters if sensitive_data is provided
+			if sensitive_data:
+				action_dump = [
+					self._filter_sensitive_data_from_dict(action, sensitive_data) if 'input' in action else action
+					for action in action_dump
+				]
+
 			model_output_dump = {
 				'evaluation_previous_goal': self.model_output.evaluation_previous_goal,
 				'memory': self.model_output.memory,
@@ -282,11 +372,16 @@ class AgentHistory(BaseModel):
 			if self.model_output.thinking is not None:
 				model_output_dump['thinking'] = self.model_output.thinking
 
+		# Handle result serialization - don't filter ActionResult data
+		# as it should contain meaningful information for the agent
+		result_dump = [r.model_dump(exclude_none=True) for r in self.result]
+
 		return {
 			'model_output': model_output_dump,
-			'result': [r.model_dump(exclude_none=True) for r in self.result],
+			'result': result_dump,
 			'state': self.state.to_dict(),
 			'metadata': self.metadata.model_dump() if self.metadata else None,
+			'state_message': self.state_message,
 		}
 
 
@@ -325,11 +420,11 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 		"""Representation of the AgentHistoryList object"""
 		return self.__str__()
 
-	def save_to_file(self, filepath: str | Path) -> None:
-		"""Save history to JSON file with proper serialization"""
+	def save_to_file(self, filepath: str | Path, sensitive_data: dict[str, str | dict[str, str]] | None = None) -> None:
+		"""Save history to JSON file with proper serialization and optional sensitive data filtering"""
 		try:
 			Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-			data = self.model_dump()
+			data = self.model_dump(sensitive_data=sensitive_data)
 			with open(filepath, 'w', encoding='utf-8') as f:
 				json.dump(data, f, indent=2)
 		except Exception as e:
@@ -374,10 +469,7 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 		}
 
 	@classmethod
-	def load_from_file(cls, filepath: str | Path, output_model: type[AgentOutput]) -> AgentHistoryList:
-		"""Load history from JSON file"""
-		with open(filepath, encoding='utf-8') as f:
-			data = json.load(f)
+	def load_from_dict(cls, data: dict[str, Any], output_model: type[AgentOutput]) -> AgentHistoryList:
 		# loop through history and validate output_model actions to enrich with custom actions
 		for h in data['history']:
 			if h['model_output']:
@@ -387,8 +479,16 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 					h['model_output'] = None
 			if 'interacted_element' not in h['state']:
 				h['state']['interacted_element'] = None
+
 		history = cls.model_validate(data)
 		return history
+
+	@classmethod
+	def load_from_file(cls, filepath: str | Path, output_model: type[AgentOutput]) -> AgentHistoryList:
+		"""Load history from JSON file"""
+		with open(filepath, encoding='utf-8') as f:
+			data = json.load(f)
+		return cls.load_from_dict(data, output_model)
 
 	def last_action(self) -> None | dict:
 		"""Last action in history"""
@@ -430,6 +530,29 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 	def has_errors(self) -> bool:
 		"""Check if the agent has any non-None errors"""
 		return any(error is not None for error in self.errors())
+
+	def judgement(self) -> dict | None:
+		"""Get the judgement result as a dictionary if it exists"""
+		if self.history and len(self.history[-1].result) > 0:
+			last_result = self.history[-1].result[-1]
+			if last_result.judgement:
+				return last_result.judgement.model_dump()
+		return None
+
+	def is_judged(self) -> bool:
+		"""Check if the agent trace has been judged"""
+		if self.history and len(self.history[-1].result) > 0:
+			last_result = self.history[-1].result[-1]
+			return last_result.judgement is not None
+		return False
+
+	def is_validated(self) -> bool | None:
+		"""Check if the judge validated the agent execution (verdict is True). Returns None if not judged yet."""
+		if self.history and len(self.history[-1].result) > 0:
+			last_result = self.history[-1].result[-1]
+			if last_result.judgement:
+				return last_result.judgement.verdict
+		return None
 
 	def urls(self) -> list[str | None]:
 		"""Get all unique URLs from history"""
@@ -551,6 +674,36 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 		"""Get the number of steps in the history"""
 		return len(self.history)
 
+	def agent_steps(self) -> list[str]:
+		"""Format agent history as readable step descriptions for judge evaluation."""
+		steps = []
+
+		# Iterate through history items (each is an AgentHistory)
+		for i, h in enumerate(self.history):
+			step_text = f'Step {i + 1}:\n'
+
+			# Get actions from model_output
+			if h.model_output and h.model_output.action:
+				# Use existing model_dump to get action dicts
+				actions_list = [action.model_dump(exclude_none=True) for action in h.model_output.action]
+				action_json = json.dumps(actions_list, indent=1)
+				step_text += f'Actions: {action_json}\n'
+
+			# Get results (already a list[ActionResult] in h.result)
+			if h.result:
+				for j, result in enumerate(h.result):
+					if result.extracted_content:
+						content = str(result.extracted_content)
+						step_text += f'Result {j + 1}: {content}\n'
+
+					if result.error:
+						error = str(result.error)
+						step_text += f'Error {j + 1}: {error}\n'
+
+			steps.append(step_text)
+
+		return steps
+
 	@property
 	def structured_output(self) -> AgentStructuredOutput | None:
 		"""Get the structured output from the history
@@ -581,6 +734,22 @@ class AgentError:
 			return f'{AgentError.VALIDATION_ERROR}\nDetails: {str(error)}'
 		if isinstance(error, RateLimitError):
 			return AgentError.RATE_LIMIT_ERROR
+
+		# Handle LLM response validation errors from llm_use
+		error_str = str(error)
+		if 'LLM response missing required fields' in error_str or 'Expected format: AgentOutput' in error_str:
+			# Extract the main error message without the huge stacktrace
+			lines = error_str.split('\n')
+			main_error = lines[0] if lines else error_str
+
+			# Provide a clearer error message
+			helpful_msg = f'{main_error}\n\nThe previous response had an invalid output structure. Please stick to the required output format. \n\n'
+
+			if include_trace:
+				helpful_msg += f'\n\nFull stacktrace:\n{traceback.format_exc()}'
+
+			return helpful_msg
+
 		if include_trace:
 			return f'{str(error)}\nStacktrace:\n{traceback.format_exc()}'
 		return f'{str(error)}'

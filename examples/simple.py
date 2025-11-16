@@ -1,31 +1,17 @@
-import asyncio
-import os
-import sys
-
-from browser_use.llm.openai.chat import ChatOpenAI
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+"""
+Setup:
+1. Get your API key from https://cloud.browser-use.com/new-api-key
+2. Set environment variable: export BROWSER_USE_API_KEY="your-key"
+"""
 
 from dotenv import load_dotenv
 
+from browser_use import Agent, ChatBrowserUse
+
 load_dotenv()
 
-
-from browser_use import Agent
-
-# Initialize the model
-llm = ChatOpenAI(
-	model='gpt-5-mini',
+agent = Agent(
+	task='Find the number of stars of the following repos: browser-use, playwright, stagehand, react, nextjs',
+	llm=ChatBrowserUse(),
 )
-
-
-task = 'Go to google.com/travel/flights and find the cheapest flight from New York to Paris on 2025-07-15'
-agent = Agent(task=task, llm=llm)
-
-
-async def main():
-	await agent.run()
-
-
-if __name__ == '__main__':
-	asyncio.run(main())
+agent.run_sync()

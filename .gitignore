@@ -55,41 +55,33 @@ token.json
 !docs/docs.json
 
 
+temp-profile-*
 
-.claude/settings.local.json
-.claude/settings.json
-.mcp.json
-claude-flow.config.json
-.swarm/
-.hive-mind/
-memory/claude-flow-data.json
-memory/sessions/*
-!memory/sessions/README.md
-memory/agents/*
-!memory/agents/README.md
-coordination/memory_bank/*
-coordination/subtasks/*
-coordination/orchestration/*
-*.db
-*.db-journal
-*.db-wal
-*.sqlite
-*.sqlite-journal
-*.sqlite-wal
-claude-flow
-claude-flow.bat
-claude-flow.ps1
-hive-mind-prompt-*.txt
-.claude/agents/*
-.claude/commands/*
-.claude/helpers/*
-.claude-flow/*
-memory/*
-CLAUDE.md
-.claude/.claude.json
-.roo/*
-.roomodes
+screenshot.png
 
+# *.md
+
+all_github_issues_progress.md
+all_github_issues.md
+
+todo-input-token.md
+
+TOOL_CHANGES_SUMMARY.md
+
+
+claude-code-todo
+result_judge.md
+result.md
+result2.md
+result3.md
+Brainstorm.md
+example.ipynb
+*SUMMARY.md
+todo.md
+product_extraction.ipynb
+product_extraction.py
+*report.md
+plot.py
 
 .plan-2/poc-project/outputs/browser_data
 .serena

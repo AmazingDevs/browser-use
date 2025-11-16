@@ -1,12 +1,7 @@
 """
-Getting Started Example 1: Basic Search
-
-This example demonstrates the most basic browser-use functionality:
-- Navigate to a website
-- Perform a search
-- Get results
-
-Perfect for first-time users to understand how browser-use works.
+Setup:
+1. Get your API key from https://cloud.browser-use.com/new-api-key
+2. Set environment variable: export BROWSER_USE_API_KEY="your-key"
 """
 
 import asyncio
@@ -20,18 +15,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from browser_use import Agent
-from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use import Agent, ChatBrowserUse
 
 
 async def main():
-	# Initialize the model
-	llm = ChatOpenAI(model='gpt-4.1-mini')
-
-	# Define a simple search task
+	llm = ChatBrowserUse()
 	task = "Search Google for 'what is browser automation' and tell me the top 3 results"
-
-	# Create and run the agent
 	agent = Agent(task=task, llm=llm)
 	await agent.run()
 

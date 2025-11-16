@@ -1,5 +1,5 @@
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
 
 import httpx
@@ -12,25 +12,13 @@ from openai.types.shared_params.response_format_json_schema import JSONSchema, R
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError
+from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 T = TypeVar('T', bound=BaseModel)
-
-ReasoningModels: list[ChatModel | str] = [
-	'o4-mini',
-	'o3',
-	'o3-mini',
-	'o1',
-	'o1-pro',
-	'o3-pro',
-	'gpt-5',
-	'gpt-5-mini',
-	'gpt-5-nano',
-]
 
 
 @dataclass
@@ -46,14 +34,20 @@ class ChatOpenAI(BaseChatModel):
 	model: ChatModel | str
 
 	# Model params
-	# set to 0.1 because browser-use aims to be more reliable and deterministic
 	temperature: float | None = 0.2
-	frequency_penalty: float | None = 0.1
+	frequency_penalty: float | None = 0.3  # this avoids infinite generation of \t for models like 4.1-mini
 	reasoning_effort: ReasoningEffort = 'low'
 	seed: int | None = None
 	service_tier: Literal['auto', 'default', 'flex', 'priority', 'scale'] | None = None
 	top_p: float | None = None
 	add_schema_to_system_prompt: bool = False  # Add JSON schema to system prompt instead of using response_format
+	dont_force_structured_output: bool = False  # If True, the model will not be forced to output a structured output
+	remove_min_items_from_schema: bool = (
+		False  # If True, remove minItems from JSON schema (for compatibility with some providers)
+	)
+	remove_defaults_from_schema: bool = (
+		False  # If True, remove default values from JSON schema (for compatibility with some providers)
+	)
 
 	# Client initialization parameters
 	api_key: str | None = None
@@ -62,12 +56,25 @@ class ChatOpenAI(BaseChatModel):
 	base_url: str | httpx.URL | None = None
 	websocket_base_url: str | httpx.URL | None = None
 	timeout: float | httpx.Timeout | None = None
-	max_retries: int = 10  # Increase default retries for automation reliability
+	max_retries: int = 5  # Increase default retries for automation reliability
 	default_headers: Mapping[str, str] | None = None
 	default_query: Mapping[str, object] | None = None
 	http_client: httpx.AsyncClient | None = None
 	_strict_response_validation: bool = False
-	max_completion_tokens: int | None = 8000
+	max_completion_tokens: int | None = 4096
+	reasoning_models: list[ChatModel | str] | None = field(
+		default_factory=lambda: [
+			'o4-mini',
+			'o3',
+			'o3-mini',
+			'o1',
+			'o1-pro',
+			'o3-pro',
+			'gpt-5',
+			'gpt-5-mini',
+			'gpt-5-nano',
+		]
+	)
 
 	# Static
 	@property
@@ -181,7 +188,7 @@ class ChatOpenAI(BaseChatModel):
 			if self.service_tier is not None:
 				model_params['service_tier'] = self.service_tier
 
-			if any(str(m).lower() in str(self.model).lower() for m in ReasoningModels):
+			if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
 				model_params['reasoning_effort'] = self.reasoning_effort
 				del model_params['temperature']
 				del model_params['frequency_penalty']
@@ -198,13 +205,18 @@ class ChatOpenAI(BaseChatModel):
 				return ChatInvokeCompletion(
 					completion=response.choices[0].message.content or '',
 					usage=usage,
+					stop_reason=response.choices[0].finish_reason if response.choices else None,
 				)
 
 			else:
 				response_format: JSONSchema = {
 					'name': 'agent_output',
 					'strict': True,
-					'schema': SchemaOptimizer.create_optimized_json_schema(output_format),
+					'schema': SchemaOptimizer.create_optimized_json_schema(
+						output_format,
+						remove_min_items=self.remove_min_items_from_schema,
+						remove_defaults=self.remove_defaults_from_schema,
+					),
 				}
 
 				# Add JSON schema to system prompt if requested
@@ -217,13 +229,20 @@ class ChatOpenAI(BaseChatModel):
 							ChatCompletionContentPartTextParam(text=schema_text, type='text')
 						]
 
-				# Return structured response
-				response = await self.get_client().chat.completions.create(
-					model=self.model,
-					messages=openai_messages,
-					response_format=ResponseFormatJSONSchema(json_schema=response_format, type='json_schema'),
-					**model_params,
-				)
+				if self.dont_force_structured_output:
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=openai_messages,
+						**model_params,
+					)
+				else:
+					# Return structured response
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=openai_messages,
+						response_format=ResponseFormatJSONSchema(json_schema=response_format, type='json_schema'),
+						**model_params,
+					)
 
 				if response.choices[0].message.content is None:
 					raise ModelProviderError(
@@ -239,35 +258,17 @@ class ChatOpenAI(BaseChatModel):
 				return ChatInvokeCompletion(
 					completion=parsed,
 					usage=usage,
+					stop_reason=response.choices[0].finish_reason if response.choices else None,
 				)
 
 		except RateLimitError as e:
-			error_message = e.response.json().get('error', {})
-			error_message = (
-				error_message.get('message', 'Unknown model error') if isinstance(error_message, dict) else error_message
-			)
-			raise ModelProviderError(
-				message=error_message,
-				status_code=e.response.status_code,
-				model=self.name,
-			) from e
+			raise ModelRateLimitError(message=e.message, model=self.name) from e
 
 		except APIConnectionError as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e
 
 		except APIStatusError as e:
-			try:
-				error_message = e.response.json().get('error', {})
-			except Exception:
-				error_message = e.response.text
-			error_message = (
-				error_message.get('message', 'Unknown model error') if isinstance(error_message, dict) else error_message
-			)
-			raise ModelProviderError(
-				message=error_message,
-				status_code=e.response.status_code,
-				model=self.name,
-			) from e
+			raise ModelProviderError(message=e.message, status_code=e.status_code, model=self.name) from e
 
 		except Exception as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e

@@ -21,7 +21,10 @@ class BaseWatchdog(BaseModel):
 	"""
 
 	model_config = ConfigDict(
-		arbitrary_types_allowed=True, validate_assignment=True, extra='forbid', revalidate_instances='never'
+		arbitrary_types_allowed=True,  # allow non-serializable objects like EventBus/BrowserSession in fields
+		extra='forbid',  # dont allow implicit class/instance state, everything must be a properly typed Field or PrivateAttr
+		validate_assignment=False,  # avoid re-triggering  __init__ / validators on values on every assignment
+		revalidate_instances='never',  # avoid re-triggering __init__ / validators and erasing private attrs
 	)
 
 	# Class variables to statically define the list of events relevant to each watchdog
@@ -49,7 +52,7 @@ class BaseWatchdog(BaseModel):
 		return self.browser_session.logger
 
 	@staticmethod
-	def attach_handler_to_session(browser_session: 'BrowserSession', event_class: type[BaseEvent], handler) -> None:
+	def attach_handler_to_session(browser_session: 'BrowserSession', event_class: type[BaseEvent[Any]], handler) -> None:
 		"""Attach a single event handler to a browser session.
 
 		Args:
@@ -70,14 +73,6 @@ class BaseWatchdog(BaseModel):
 		watchdog_instance = getattr(handler, '__self__', None)
 		watchdog_class_name = watchdog_instance.__class__.__name__ if watchdog_instance else 'Unknown'
 
-		# Color codes for logging
-		red = '\033[91m'
-		green = '\033[92m'
-		yellow = '\033[93m'
-		magenta = '\033[95m'
-		cyan = '\033[96m'
-		reset = '\033[0m'
-
 		# Create a wrapper function with unique name to avoid duplicate handler warnings
 		# Capture handler by value to avoid closure issues
 		def make_unique_handler(actual_handler):
@@ -90,15 +85,15 @@ class BaseWatchdog(BaseModel):
 					else None
 				)
 				parent = (
-					f'{yellow}↲  triggered by {cyan}on_{parent_event.event_type}#{parent_event.event_id[-4:]}{reset}'
+					f'↲  triggered by on_{parent_event.event_type}#{parent_event.event_id[-4:]}'
 					if parent_event
-					else f'{magenta}👈 by Agent{reset}'
+					else '👈 by Agent'
 				)
 				grandparent = (
 					(
-						f'{yellow}↲  under {cyan}{grandparent_event.event_type}#{grandparent_event.event_id[-4:]}{reset}'
+						f'↲  under {grandparent_event.event_type}#{grandparent_event.event_id[-4:]}'
 						if grandparent_event
-						else f'{magenta}👈 by Agent{reset}'
+						else '👈 by Agent'
 					)
 					if parent_event
 					else ''
@@ -106,9 +101,7 @@ class BaseWatchdog(BaseModel):
 				event_str = f'#{event.event_id[-4:]}'
 				time_start = time.time()
 				watchdog_and_handler_str = f'[{watchdog_class_name}.{actual_handler.__name__}({event_str})]'.ljust(54)
-				browser_session.logger.debug(
-					f'{cyan}🚌 {watchdog_and_handler_str} ⏳ Starting...      {reset} {parent} {grandparent}'
-				)
+				browser_session.logger.debug(f'🚌 {watchdog_and_handler_str} ⏳ Starting...       {parent} {grandparent}')
 
 				try:
 					# **EXECUTE THE EVENT HANDLER FUNCTION**
@@ -120,12 +113,12 @@ class BaseWatchdog(BaseModel):
 					# just for debug logging, not used for anything else
 					time_end = time.time()
 					time_elapsed = time_end - time_start
-					result_summary = '' if result is None else f' ➡️ {magenta}<{type(result).__name__}>{reset}'
-					parents_summary = f' {parent}'.replace('↲  triggered by ', f'⤴  {green}returned to  {cyan}').replace(
-						'👈 by Agent', f'👉 {green}returned to  {magenta}Agent{reset}'
+					result_summary = '' if result is None else f' ➡️ <{type(result).__name__}>'
+					parents_summary = f' {parent}'.replace('↲  triggered by ', '⤴  returned to  ').replace(
+						'👈 by Agent', '👉 returned to  Agent'
 					)
 					browser_session.logger.debug(
-						f'{green}🚌 {watchdog_and_handler_str} ✅ Succeeded ({time_elapsed:.2f}s){reset}{result_summary}{parents_summary}'
+						f'🚌 {watchdog_and_handler_str} Succeeded ({time_elapsed:.2f}s){result_summary}{parents_summary}'
 					)
 					return result
 				except Exception as e:
@@ -133,37 +126,37 @@ class BaseWatchdog(BaseModel):
 					time_elapsed = time_end - time_start
 					original_error = e
 					browser_session.logger.error(
-						f'{red}🚌 {watchdog_and_handler_str} ❌ Failed ({time_elapsed:.2f}s): {type(e).__name__}: {e}{reset}'
+						f'🚌 {watchdog_and_handler_str} ❌ Failed ({time_elapsed:.2f}s): {type(e).__name__}: {e}'
 					)
 
 					# attempt to repair potentially crashed CDP session
 					try:
-						if browser_session.agent_focus and browser_session.agent_focus.target_id:
-							# Common issue with CDP, some calls need the target to be active/foreground to succeed:
-							#   screenshot, scroll, Page.handleJavaScriptDialog, and some others
+						if browser_session.agent_focus_target_id:
+							# With event-driven sessions, Chrome will send detach/attach events
+							# SessionManager handles pool cleanup automatically
+							target_id_to_restore = browser_session.agent_focus_target_id
 							browser_session.logger.debug(
-								f'{yellow}🚌 {watchdog_and_handler_str} ⚠️ Re-foregrounding target to try and recover crashed CDP session\n\t{browser_session.agent_focus}{reset}'
+								f'🚌 {watchdog_and_handler_str} ⚠️ Session error detected, waiting for CDP events to sync (target: {target_id_to_restore})'
 							)
-							del browser_session._cdp_session_pool[browser_session.agent_focus.target_id]
-							browser_session.agent_focus = await browser_session.get_or_create_cdp_session(
-								target_id=browser_session.agent_focus.target_id, new_socket=True
-							)
-							await browser_session.agent_focus.cdp_client.send.Target.activateTarget(
-								params={'targetId': browser_session.agent_focus.target_id}
-							)
+
+							# Wait for new attach event to restore the session
+							# This will raise ValueError if target doesn't re-attach
+							await browser_session.get_or_create_cdp_session(target_id=target_id_to_restore, focus=True)
 						else:
-							await browser_session.get_or_create_cdp_session(target_id=None, new_socket=True, focus=True)
+							# Try to get any available session
+							await browser_session.get_or_create_cdp_session(target_id=None, focus=True)
 					except Exception as sub_error:
 						if 'ConnectionClosedError' in str(type(sub_error)) or 'ConnectionError' in str(type(sub_error)):
 							browser_session.logger.error(
-								f'{red}🚌 {watchdog_and_handler_str} ❌ Browser closed or CDP Connection disconnected by remote. {red}{type(sub_error).__name__}: {sub_error}{reset}\n'
+								f'🚌 {watchdog_and_handler_str} ❌ Browser closed or CDP Connection disconnected by remote. {type(sub_error).__name__}: {sub_error}\n'
 							)
 							raise
 						else:
 							browser_session.logger.error(
-								f'{red}🚌 {watchdog_and_handler_str} ❌ CDP connected but failed to re-create CDP session after error "{type(original_error).__name__}: {original_error}" in {cyan}{actual_handler.__name__}({event.event_type}#{event.event_id[-4:]}){reset}: due to {red}{type(sub_error).__name__}: {sub_error}{reset}\n'
+								f'🚌 {watchdog_and_handler_str} ❌ CDP connected but failed to re-create CDP session after error "{type(original_error).__name__}: {original_error}" in {actual_handler.__name__}({event.event_type}#{event.event_id[-4:]}): due to {type(sub_error).__name__}: {sub_error}\n'
 							)
 
+					# Always re-raise the original error with its traceback preserved
 					raise
 
 			return unique_handler
@@ -262,4 +255,4 @@ class BaseWatchdog(BaseModel):
 		except Exception as e:
 			from browser_use.utils import logger
 
-			logger.error(f'⚠️ Error during BrowserSession {self.__class__.__name__} gargabe collection __del__(): {type(e)}: {e}')
+			logger.error(f'⚠️ Error during BrowserSession {self.__class__.__name__} garbage collection __del__(): {type(e)}: {e}')

@@ -23,14 +23,26 @@ Or as an MCP server in Claude Desktop or other MCP clients:
     }
 """
 
+import os
+import sys
+
+from browser_use.llm import ChatAWSBedrock
+
+# Set environment variables BEFORE any browser_use imports to prevent early logging
+os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'critical'
+os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
+
 import asyncio
 import json
 import logging
-import os
-import sys
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
+
+# Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
+logging.basicConfig(
+	stream=sys.stderr, level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True
+)
 
 try:
 	import psutil
@@ -49,39 +61,41 @@ from browser_use.logging_config import setup_logging
 def _configure_mcp_server_logging():
 	"""Configure logging for MCP server mode - redirect all logs to stderr to prevent JSON RPC interference."""
 	# Set environment to suppress browser-use logging during server mode
-	os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'error'
+	os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'warning'
 	os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'  # Prevent automatic logging setup
 
-	# Configure logging to stderr for MCP mode
-	setup_logging(stream=sys.stderr, log_level='error', force_setup=True)
+	# Configure logging to stderr for MCP mode - preserve warnings and above for troubleshooting
+	setup_logging(stream=sys.stderr, log_level='warning', force_setup=True)
 
 	# Also configure the root logger and all existing loggers to use stderr
 	logging.root.handlers = []
 	stderr_handler = logging.StreamHandler(sys.stderr)
 	stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 	logging.root.addHandler(stderr_handler)
-	logging.root.setLevel(logging.ERROR)
+	logging.root.setLevel(logging.CRITICAL)
 
-	# Configure all existing loggers to use stderr
+	# Configure all existing loggers to use stderr and CRITICAL level
 	for name in list(logging.root.manager.loggerDict.keys()):
 		logger_obj = logging.getLogger(name)
 		logger_obj.handlers = []
+		logger_obj.setLevel(logging.CRITICAL)
 		logger_obj.addHandler(stderr_handler)
-		logger_obj.setLevel(logging.ERROR)
 		logger_obj.propagate = False
 
 
 # Configure MCP server logging before any browser_use imports to capture early log lines
 _configure_mcp_server_logging()
 
+# Additional suppression - disable all logging completely for MCP mode
+logging.disable(logging.CRITICAL)
+
 # Import browser_use modules
 from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
-from browser_use.browser.events import ClickElementEvent
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
-from browser_use.controller.service import Controller
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.tools.service import Tools
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +115,13 @@ def _ensure_all_loggers_use_stderr():
 
 	# Configure root logger
 	logging.root.handlers = [stderr_handler]
-	logging.root.setLevel(logging.ERROR)
+	logging.root.setLevel(logging.CRITICAL)
 
 	# Configure all existing loggers
 	for name in list(logging.root.manager.loggerDict.keys()):
 		logger_obj = logging.getLogger(name)
 		logger_obj.handlers = [stderr_handler]
-		logger_obj.setLevel(logging.ERROR)
+		logger_obj.setLevel(logging.CRITICAL)
 		logger_obj.propagate = False
 
 
@@ -136,7 +150,7 @@ except ImportError:
 	sys.exit(1)
 
 from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
-from browser_use.utils import get_browser_use_version
+from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
 
 def get_parent_process_cmdline() -> str | None:
@@ -173,7 +187,7 @@ def get_parent_process_cmdline() -> str | None:
 class BrowserUseServer:
 	"""MCP Server for browser-use capabilities."""
 
-	def __init__(self):
+	def __init__(self, session_timeout_minutes: int = 10):
 		# Ensure all logging goes to stderr (in case new loggers were created)
 		_ensure_all_loggers_use_stderr()
 
@@ -181,11 +195,16 @@ class BrowserUseServer:
 		self.config = load_browser_use_config()
 		self.agent: Agent | None = None
 		self.browser_session: BrowserSession | None = None
-		self.controller: Controller | None = None
+		self.tools: Tools | None = None
 		self.llm: ChatOpenAI | None = None
 		self.file_system: FileSystem | None = None
 		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
+
+		# Session management
+		self.active_sessions: dict[str, dict[str, Any]] = {}  # session_id -> session info
+		self.session_timeout_minutes = session_timeout_minutes
+		self._cleanup_task: Any = None
 
 		# Setup handlers
 		self._setup_handlers()
@@ -304,8 +323,8 @@ class BrowserUseServer:
 					description='Switch to a different tab',
 					inputSchema={
 						'type': 'object',
-						'properties': {'tab_index': {'type': 'integer', 'description': 'Index of the tab to switch to'}},
-						'required': ['tab_index'],
+						'properties': {'tab_id': {'type': 'string', 'description': '4 Character Tab ID of the tab to switch to'}},
+						'required': ['tab_id'],
 					},
 				),
 				types.Tool(
@@ -313,8 +332,8 @@ class BrowserUseServer:
 					description='Close a tab',
 					inputSchema={
 						'type': 'object',
-						'properties': {'tab_index': {'type': 'integer', 'description': 'Index of the tab to close'}},
-						'required': ['tab_index'],
+						'properties': {'tab_id': {'type': 'string', 'description': '4 Character Tab ID of the tab to close'}},
+						'required': ['tab_id'],
 					},
 				),
 				# types.Tool(
@@ -337,7 +356,7 @@ class BrowserUseServer:
 							},
 							'max_steps': {
 								'type': 'integer',
-								'description': 'Maximum number of steps the agent can take',
+								'description': 'Maximum number of steps an agent can take.',
 								'default': 100,
 							},
 							'model': {
@@ -360,7 +379,42 @@ class BrowserUseServer:
 						'required': ['task'],
 					},
 				),
+				# Browser session management tools
+				types.Tool(
+					name='browser_list_sessions',
+					description='List all active browser sessions with their details and last activity time',
+					inputSchema={'type': 'object', 'properties': {}},
+				),
+				types.Tool(
+					name='browser_close_session',
+					description='Close a specific browser session by its ID',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'session_id': {
+								'type': 'string',
+								'description': 'The browser session ID to close (get from browser_list_sessions)',
+							}
+						},
+						'required': ['session_id'],
+					},
+				),
+				types.Tool(
+					name='browser_close_all',
+					description='Close all active browser sessions and clean up resources',
+					inputSchema={'type': 'object', 'properties': {}},
+				),
 			]
+
+		@self.server.list_resources()
+		async def handle_list_resources() -> list[types.Resource]:
+			"""List available resources (none for browser-use)."""
+			return []
+
+		@self.server.list_prompts()
+		async def handle_list_prompts() -> list[types.Prompt]:
+			"""List available prompts (none for browser-use)."""
+			return []
 
 		@self.server.call_tool()
 		async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
@@ -400,8 +454,18 @@ class BrowserUseServer:
 				use_vision=arguments.get('use_vision', True),
 			)
 
+		# Browser session management tools (don't require active session)
+		if tool_name == 'browser_list_sessions':
+			return await self._list_sessions()
+
+		elif tool_name == 'browser_close_session':
+			return await self._close_session(arguments['session_id'])
+
+		elif tool_name == 'browser_close_all':
+			return await self._close_all_sessions()
+
 		# Direct browser control tools (require active session)
-		if tool_name.startswith('browser_'):
+		elif tool_name.startswith('browser_'):
 			# Ensure browser session exists
 			if not self.browser_session:
 				await self._init_browser_session()
@@ -434,10 +498,10 @@ class BrowserUseServer:
 				return await self._list_tabs()
 
 			elif tool_name == 'browser_switch_tab':
-				return await self._switch_tab(arguments['tab_index'])
+				return await self._switch_tab(arguments['tab_id'])
 
 			elif tool_name == 'browser_close_tab':
-				return await self._close_tab(arguments['tab_index'])
+				return await self._close_tab(arguments['tab_id'])
 
 		return f'Unknown tool: {tool_name}'
 
@@ -460,7 +524,6 @@ class BrowserUseServer:
 			'wait_between_actions': 0.5,
 			'keep_alive': True,
 			'user_data_dir': '~/.config/browseruse/profiles/default',
-			'is_mobile': False,
 			'device_scale_factor': 1.0,
 			'disable_security': False,
 			'headless': False,
@@ -482,8 +545,11 @@ class BrowserUseServer:
 		self.browser_session = BrowserSession(browser_profile=profile)
 		await self.browser_session.start()
 
-		# Create controller for direct actions
-		self.controller = Controller()
+		# Track the session for management
+		self._track_session(self.browser_session)
+
+		# Create tools for direct actions
+		self.tools = Tools()
 
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
@@ -514,21 +580,37 @@ class BrowserUseServer:
 
 		# Get LLM config
 		llm_config = get_default_llm(self.config)
-		api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
-		if not api_key:
-			return 'Error: OPENAI_API_KEY not set in config or environment'
 
-		# Override model if provided in tool call
-		if model != llm_config.get('model', 'gpt-4o'):
-			llm_model = model
+		# Get LLM provider
+		model_provider = llm_config.get('model_provider') or os.getenv('MODEL_PROVIDER')
+
+		# 如果model_provider不等于空，且等Bedrock
+		if model_provider and model_provider.lower() == 'bedrock':
+			llm_model = llm_config.get('model') or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
+			aws_region = llm_config.get('region') or os.getenv('REGION')
+			if not aws_region:
+				aws_region = 'us-east-1'
+			llm = ChatAWSBedrock(
+				model=llm_model,  # or any Bedrock model
+				aws_region=aws_region,
+				aws_sso_auth=True,
+			)
 		else:
-			llm_model = llm_config.get('model', 'gpt-4o')
+			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
+			if not api_key:
+				return 'Error: OPENAI_API_KEY not set in config or environment'
 
-		llm = ChatOpenAI(
-			model=llm_model,
-			api_key=api_key,
-			temperature=llm_config.get('temperature', 0.7),
-		)
+			# Override model if provided in tool call
+			if model != llm_config.get('model', 'gpt-4o'):
+				llm_model = model
+			else:
+				llm_model = llm_config.get('model', 'gpt-4o')
+
+			llm = ChatOpenAI(
+				model=llm_model,
+				api_key=api_key,
+				temperature=llm_config.get('temperature', 0.7),
+			)
 
 		# Get profile config and merge with tool parameters
 		profile_config = get_default_profile(self.config)
@@ -588,15 +670,15 @@ class BrowserUseServer:
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
+		# Update session activity
+		self._update_session_activity(self.browser_session.id)
+
 		from browser_use.browser.events import NavigateToUrlEvent
-		
+
 		if new_tab:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
 			await event
-			# Get the current tab count to determine the new tab index
-			tabs = await self.browser_session.get_tabs()
-			tab_index = len(tabs) - 1
-			return f'Opened new tab #{tab_index} with URL: {url}'
+			return f'Opened new tab with URL: {url}'
 		else:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
 			await event
@@ -606,6 +688,9 @@ class BrowserUseServer:
 		"""Click an element by index."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
+
+		# Update session activity
+		self._update_session_activity(self.browser_session.id)
 
 		# Get the element
 		element = await self.browser_session.get_dom_element_by_index(index)
@@ -630,21 +715,22 @@ class BrowserUseServer:
 
 				# Open link in new tab
 				from browser_use.browser.events import NavigateToUrlEvent
+
 				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=full_url, new_tab=True))
 				await event
-				tabs = await self.browser_session.get_tabs()
-				tab_index = len(tabs) - 1
-				return f'Clicked element {index} and opened in new tab #{tab_index}'
+				return f'Clicked element {index} and opened in new tab {full_url[:20]}...'
 			else:
 				# For non-link elements, just do a normal click
 				# Opening in new tab without href is not reliably supported
 				from browser_use.browser.events import ClickElementEvent
+
 				event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 				await event
 				return f'Clicked element {index} (new tab not supported for non-link elements)'
 		else:
 			# Normal click
 			from browser_use.browser.events import ClickElementEvent
+
 			event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 			await event
 			return f'Clicked element {index}'
@@ -659,16 +745,48 @@ class BrowserUseServer:
 			return f'Element with index {index} not found'
 
 		from browser_use.browser.events import TypeTextEvent
-		event = self.browser_session.event_bus.dispatch(TypeTextEvent(node=element, text=text))
+
+		# Conservative heuristic to detect potentially sensitive data
+		# Only flag very obvious patterns to minimize false positives
+		is_potentially_sensitive = len(text) >= 6 and (
+			# Email pattern: contains @ and a domain-like suffix
+			('@' in text and '.' in text.split('@')[-1] if '@' in text else False)
+			# Mixed alphanumeric with reasonable complexity (likely API keys/tokens)
+			or (
+				len(text) >= 16
+				and any(char.isdigit() for char in text)
+				and any(char.isalpha() for char in text)
+				and any(char in '.-_' for char in text)
+			)
+		)
+
+		# Use generic key names to avoid information leakage about detection patterns
+		sensitive_key_name = None
+		if is_potentially_sensitive:
+			if '@' in text and '.' in text.split('@')[-1]:
+				sensitive_key_name = 'email'
+			else:
+				sensitive_key_name = 'credential'
+
+		event = self.browser_session.event_bus.dispatch(
+			TypeTextEvent(node=element, text=text, is_sensitive=is_potentially_sensitive, sensitive_key_name=sensitive_key_name)
+		)
 		await event
-		return f"Typed '{text}' into element {index}"
+
+		if is_potentially_sensitive:
+			if sensitive_key_name:
+				return f'Typed <{sensitive_key_name}> into element {index}'
+			else:
+				return f'Typed <sensitive> into element {index}'
+		else:
+			return f"Typed '{text}' into element {index}"
 
 	async def _get_browser_state(self, include_screenshot: bool = False) -> str:
 		"""Get current browser state."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		state = await self.browser_session.get_browser_state_summary(cache_clickable_elements_hashes=False)
+		state = await self.browser_session.get_browser_state_summary()
 
 		result = {
 			'url': state.url,
@@ -706,24 +824,29 @@ class BrowserUseServer:
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		if not self.controller:
-			return 'Error: Controller not initialized'
+		if not self.tools:
+			return 'Error: Tools not initialized'
 
 		state = await self.browser_session.get_browser_state_summary()
 
-		# Use the extract_structured_data action
-		# Create a dynamic action model that matches the controller's expectations
+		# Use the extract action
+		# Create a dynamic action model that matches the tools's expectations
 		from pydantic import create_model
 
 		# Create action model dynamically
 		ExtractAction = create_model(
 			'ExtractAction',
 			__base__=ActionModel,
-			extract_structured_data=(dict[str, Any], {'query': query, 'extract_links': extract_links}),
+			extract=dict[str, Any],
 		)
 
-		action = ExtractAction()
-		action_result = await self.controller.act(
+		# Use model_validate because Pyright does not understand the dynamic model
+		action = ExtractAction.model_validate(
+			{
+				'extract': {'query': query, 'extract_links': extract_links},
+			}
+		)
+		action_result = await self.tools.act(
 			action=action,
 			browser_session=self.browser_session,
 			page_extraction_llm=self.llm,
@@ -738,12 +861,14 @@ class BrowserUseServer:
 			return 'Error: No browser session active'
 
 		from browser_use.browser.events import ScrollEvent
-		
+
 		# Scroll by a standard amount (500 pixels)
-		event = self.browser_session.event_bus.dispatch(ScrollEvent(
-			direction=direction,  # type: ignore
-			amount=500
-		))
+		event = self.browser_session.event_bus.dispatch(
+			ScrollEvent(
+				direction=direction,  # type: ignore
+				amount=500,
+			)
+		)
 		await event
 		return f'Scrolled {direction}'
 
@@ -753,6 +878,7 @@ class BrowserUseServer:
 			return 'Error: No browser session active'
 
 		from browser_use.browser.events import GoBackEvent
+
 		event = self.browser_session.event_bus.dispatch(GoBackEvent())
 		await event
 		return 'Navigated back'
@@ -761,10 +887,11 @@ class BrowserUseServer:
 		"""Close the browser session."""
 		if self.browser_session:
 			from browser_use.browser.events import BrowserStopEvent
+
 			event = self.browser_session.event_bus.dispatch(BrowserStopEvent())
 			await event
 			self.browser_session = None
-			self.controller = None
+			self.tools = None
 			return 'Browser closed'
 		return 'No browser session to close'
 
@@ -776,36 +903,169 @@ class BrowserUseServer:
 		tabs_info = await self.browser_session.get_tabs()
 		tabs = []
 		for i, tab in enumerate(tabs_info):
-			tabs.append({'index': i, 'url': tab.url, 'title': tab.title or ''})
+			tabs.append({'tab_id': tab.target_id[-4:], 'url': tab.url, 'title': tab.title or ''})
 		return json.dumps(tabs, indent=2)
 
-	async def _switch_tab(self, tab_index: int) -> str:
+	async def _switch_tab(self, tab_id: str) -> str:
 		"""Switch to a different tab."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
 		from browser_use.browser.events import SwitchTabEvent
-		event = self.browser_session.event_bus.dispatch(SwitchTabEvent(tab_index=tab_index))
+
+		target_id = await self.browser_session.get_target_id_from_tab_id(tab_id)
+		event = self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
 		await event
 		state = await self.browser_session.get_browser_state_summary()
-		return f'Switched to tab {tab_index}: {state.url}'
+		return f'Switched to tab {tab_id}: {state.url}'
 
-	async def _close_tab(self, tab_index: int) -> str:
+	async def _close_tab(self, tab_id: str) -> str:
 		"""Close a specific tab."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		tabs = await self.browser_session.get_tabs()
-		if 0 <= tab_index < len(tabs):
-			url = tabs[tab_index].url
-			from browser_use.browser.events import CloseTabEvent
-			event = self.browser_session.event_bus.dispatch(CloseTabEvent(tab_index=tab_index))
-			await event
-			return f'Closed tab {tab_index}: {url}'
-		return f'Invalid tab index: {tab_index}'
+		from browser_use.browser.events import CloseTabEvent
+
+		target_id = await self.browser_session.get_target_id_from_tab_id(tab_id)
+		event = self.browser_session.event_bus.dispatch(CloseTabEvent(target_id=target_id))
+		await event
+		current_url = await self.browser_session.get_current_page_url()
+		return f'Closed tab # {tab_id}, now on {current_url}'
+
+	def _track_session(self, session: BrowserSession) -> None:
+		"""Track a browser session for management."""
+		self.active_sessions[session.id] = {
+			'session': session,
+			'created_at': time.time(),
+			'last_activity': time.time(),
+			'url': getattr(session, 'current_url', None),
+		}
+
+	def _update_session_activity(self, session_id: str) -> None:
+		"""Update the last activity time for a session."""
+		if session_id in self.active_sessions:
+			self.active_sessions[session_id]['last_activity'] = time.time()
+
+	async def _list_sessions(self) -> str:
+		"""List all active browser sessions."""
+		if not self.active_sessions:
+			return 'No active browser sessions'
+
+		sessions_info = []
+		for session_id, session_data in self.active_sessions.items():
+			session = session_data['session']
+			created_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_data['created_at']))
+			last_activity = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_data['last_activity']))
+
+			# Check if session is still active
+			is_active = hasattr(session, 'cdp_client') and session.cdp_client is not None
+
+			sessions_info.append(
+				{
+					'session_id': session_id,
+					'created_at': created_at,
+					'last_activity': last_activity,
+					'active': is_active,
+					'current_url': session_data.get('url', 'Unknown'),
+					'age_minutes': (time.time() - session_data['created_at']) / 60,
+				}
+			)
+
+		return json.dumps(sessions_info, indent=2)
+
+	async def _close_session(self, session_id: str) -> str:
+		"""Close a specific browser session."""
+		if session_id not in self.active_sessions:
+			return f'Session {session_id} not found'
+
+		session_data = self.active_sessions[session_id]
+		session = session_data['session']
+
+		try:
+			# Close the session
+			if hasattr(session, 'kill'):
+				await session.kill()
+			elif hasattr(session, 'close'):
+				await session.close()
+
+			# Remove from tracking
+			del self.active_sessions[session_id]
+
+			# If this was the current session, clear it
+			if self.browser_session and self.browser_session.id == session_id:
+				self.browser_session = None
+				self.tools = None
+
+			return f'Successfully closed session {session_id}'
+		except Exception as e:
+			return f'Error closing session {session_id}: {str(e)}'
+
+	async def _close_all_sessions(self) -> str:
+		"""Close all active browser sessions."""
+		if not self.active_sessions:
+			return 'No active sessions to close'
+
+		closed_count = 0
+		errors = []
+
+		for session_id in list(self.active_sessions.keys()):
+			try:
+				result = await self._close_session(session_id)
+				if 'Successfully closed' in result:
+					closed_count += 1
+				else:
+					errors.append(f'{session_id}: {result}')
+			except Exception as e:
+				errors.append(f'{session_id}: {str(e)}')
+
+		# Clear current session references
+		self.browser_session = None
+		self.tools = None
+
+		result = f'Closed {closed_count} sessions'
+		if errors:
+			result += f'. Errors: {"; ".join(errors)}'
+
+		return result
+
+	async def _cleanup_expired_sessions(self) -> None:
+		"""Background task to clean up expired sessions."""
+		current_time = time.time()
+		timeout_seconds = self.session_timeout_minutes * 60
+
+		expired_sessions = []
+		for session_id, session_data in self.active_sessions.items():
+			last_activity = session_data['last_activity']
+			if current_time - last_activity > timeout_seconds:
+				expired_sessions.append(session_id)
+
+		for session_id in expired_sessions:
+			try:
+				await self._close_session(session_id)
+				logger.info(f'Auto-closed expired session {session_id}')
+			except Exception as e:
+				logger.error(f'Error auto-closing session {session_id}: {e}')
+
+	async def _start_cleanup_task(self) -> None:
+		"""Start the background cleanup task."""
+
+		async def cleanup_loop():
+			while True:
+				try:
+					await self._cleanup_expired_sessions()
+					# Check every 2 minutes
+					await asyncio.sleep(120)
+				except Exception as e:
+					logger.error(f'Error in cleanup task: {e}')
+					await asyncio.sleep(120)
+
+		self._cleanup_task = create_task_with_error_handling(cleanup_loop(), name='mcp_cleanup_loop', suppress_exceptions=True)
 
 	async def run(self):
 		"""Run the MCP server."""
+		# Start the cleanup task
+		await self._start_cleanup_task()
+
 		async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
 			await self.server.run(
 				read_stream,
@@ -821,14 +1081,12 @@ class BrowserUseServer:
 			)
 
 
-async def main():
-	"""Main entry point."""
+async def main(session_timeout_minutes: int = 10):
 	if not MCP_AVAILABLE:
 		print('MCP SDK is required. Install with: pip install mcp', file=sys.stderr)
 		sys.exit(1)
 
-	server = BrowserUseServer()
-	# Capture telemetry for server start
+	server = BrowserUseServer(session_timeout_minutes=session_timeout_minutes)
 	server._telemetry.capture(
 		MCPServerTelemetryEvent(
 			version=get_browser_use_version(),
@@ -836,10 +1094,10 @@ async def main():
 			parent_process_cmdline=get_parent_process_cmdline(),
 		)
 	)
+
 	try:
 		await server.run()
 	finally:
-		# Capture telemetry for server stop
 		duration = time.time() - server._start_time
 		server._telemetry.capture(
 			MCPServerTelemetryEvent(

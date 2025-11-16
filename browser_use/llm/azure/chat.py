@@ -43,7 +43,7 @@ class ChatAzureOpenAI(ChatOpenAILike):
 	def _get_client_params(self) -> dict[str, Any]:
 		_client_params: dict[str, Any] = {}
 
-		self.api_key = self.api_key or os.getenv('AZURE_OPENAI_API_KEY')
+		self.api_key = self.api_key or os.getenv('AZURE_OPENAI_KEY') or os.getenv('AZURE_OPENAI_API_KEY')
 		self.azure_endpoint = self.azure_endpoint or os.getenv('AZURE_OPENAI_ENDPOINT')
 		self.azure_deployment = self.azure_deployment or os.getenv('AZURE_OPENAI_DEPLOYMENT')
 		params_mapping = {
@@ -83,7 +83,7 @@ class ChatAzureOpenAI(ChatOpenAILike):
 		else:
 			# Create a new async HTTP client with custom limits
 			_client_params['http_client'] = httpx.AsyncClient(
-				limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100)
+				limits=httpx.Limits(max_connections=20, max_keepalive_connections=6)
 			)
 
 		self.client = AsyncAzureOpenAIClient(**_client_params)

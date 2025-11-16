@@ -17,8 +17,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 # Local module imports
-from browser_use import Agent
-from browser_use.llm import ChatOpenAI
+from browser_use import Agent, ChatOpenAI
 
 
 @dataclass
@@ -70,7 +69,7 @@ async def run_browser_task(
 	try:
 		agent = Agent(
 			task=task,
-			llm=ChatOpenAI(model='gpt-4.1'),
+			llm=ChatOpenAI(model='gpt-4.1-mini'),
 		)
 		result = await agent.run()
 		#  TODO: The result could be parsed better
@@ -91,8 +90,8 @@ def create_ui():
 					placeholder='E.g., Find flights from New York to London for next week',
 					lines=3,
 				)
-				model = gr.Dropdown(choices=['gpt-4', 'gpt-3.5-turbo'], label='Model', value='gpt-4')
-				headless = gr.Checkbox(label='Run Headless', value=True)
+				model = gr.Dropdown(choices=['gpt-4.1-mini', 'gpt-5', 'o3', 'gpt-5-mini'], label='Model', value='gpt-4.1-mini')
+				headless = gr.Checkbox(label='Run Headless', value=False)
 				submit_btn = gr.Button('Run Task')
 
 			with gr.Column():
